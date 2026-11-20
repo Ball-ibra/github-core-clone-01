@@ -99,6 +99,10 @@ export class Repo {
   nextPull = 1;
   nextComment = 1;
   seq = 0; // creation order, for stable sorting
+  /** Parents per commit id, filled lazily: commit objects are immutable
+   *  (same id = same bytes), so a parsed parent list never goes stale.
+   *  isAncestor walks the same chain on every push of a long branch. */
+  parentsCache = new Map<string, string[]>();
   constructor(id: number, owner: string, name: string, priv: boolean, description: string) {
     this.id = id; this.owner = owner; this.name = name;
     this.privateFlag = priv; this.description = description;
@@ -237,6 +241,16 @@ export function filesAt(repo: Repo, commitOid: string): Map<string, { oid: strin
   return flattenTree(repo, parseCommit(obj.data).tree);
 }
 
+/** The parents of a commit, from the cache when already parsed. */
+export function commitParents(repo: Repo, oid: string): string[] {
+  const cached = repo.parentsCache.get(oid);
+  if (cached) return cached;
+  const obj = repo.objects.get(oid);
+  const parents = obj && obj.type === 'commit' ? parseCommit(obj.data).parents : [];
+  repo.parentsCache.set(oid, parents);
+  return parents;
+}
+
 /** True when `anc` is an ancestor of `desc` (or the same commit). */
 export function isAncestor(repo: Repo, anc: string, desc: string): boolean {
   if (anc === desc) return true;
@@ -246,9 +260,7 @@ export function isAncestor(repo: Repo, anc: string, desc: string): boolean {
     const cur = stack.pop() as string;
     if (seen.has(cur)) continue;
     seen.add(cur);
-    const obj = repo.objects.get(cur);
-    if (!obj || obj.type !== 'commit') continue;
-    for (const p of parseCommit(obj.data).parents) {
+    for (const p of commitParents(repo, cur)) {
       if (p === anc) return true;
       stack.push(p);
     }
@@ -265,6 +277,9 @@ export function collectReachable(repo: Repo, roots: string[], maxDepth?: number)
   const objects = new Map<string, GitObject>();
   const shallow: string[] = [];
   const queue: { oid: string; depth: number }[] = roots.filter((o) => o !== ZERO_OID).map((oid) => ({ oid, depth: 0 }));
+  // An index cursor, not shift(): a full-history walk holds hundreds of
+  // commits and shift() re-copies the array on every pop.
+  let qi = 0;
   const seenCommits = new Set<string>();
   const addTree = (treeOid: string): void => {
     const stack = [treeOid];
@@ -282,8 +297,9 @@ export function collectReachable(repo: Repo, roots: string[], maxDepth?: number)
       }
     }
   };
-  while (queue.length > 0) {
-    const { oid, depth } = queue.shift() as { oid: string; depth: number };
+  while (qi < queue.length) {
+    const { oid, depth } = queue[qi] as { oid: string; depth: number };
+    qi += 1;
     // A tag object itself travels with its commit: keep it in the pack.
     const raw = repo.objects.get(oid);
     if (raw && raw.type === 'tag') objects.set(oid, raw);

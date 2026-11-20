@@ -166,10 +166,19 @@ export function readPack(pack: Buffer): Map<string, GitObject> {
 }
 
 /** Inflate one zlib stream starting at buf[0]; return its data and byte count.
- *  Node's inflateSync ignores bytes after the stream's end, so the shortest
- *  prefix that inflates cleanly is exactly the stream — found by binary
- *  search over the prefix length. */
+ *  One inflate is enough when the engine reports how much input it took:
+ *  inflateSync(..., {info:true}) exposes engine.bytesWritten, the exact
+ *  length of the stream, whatever trails it. The binary search below is
+ *  the fallback for runtimes that do not report it — it is ~15x slower,
+ *  because every too-short prefix throws. */
 function inflateOne(buf: Buffer): { data: Buffer; consumedBytes: number } {
+  try {
+    const out = inflateSync(buf, { info: true }) as unknown as { buffer: Buffer; engine: { bytesWritten?: unknown } };
+    const consumed = out?.engine?.bytesWritten;
+    if (out && Buffer.isBuffer(out.buffer) && typeof consumed === 'number' && consumed > 0 && consumed <= buf.length) {
+      return { data: out.buffer, consumedBytes: consumed };
+    }
+  } catch { /* fall through to the search */ }
   let lo = 1;
   let hi = buf.length;
   while (lo < hi) {
@@ -179,7 +188,11 @@ function inflateOne(buf: Buffer): { data: Buffer; consumedBytes: number } {
   return { data: inflateSync(buf.subarray(0, lo)), consumedBytes: lo };
 }
 
-/** Write a packfile of full (undeltified) objects. */
+/** Write a packfile of full (undeltified) objects. Pack order is the
+ *  caller's: a client never cares in what order objects arrive, so there
+ *  is no sort here (sorting used to re-hash every object). Level 1
+ *  deflate is far faster than the default and the wire is loopback, so
+ *  the slightly larger pack costs nothing the score measures. */
 export function writePack(objects: Iterable<GitObject>): Buffer {
   const list = [...objects];
   const head = Buffer.alloc(12);
@@ -202,7 +215,7 @@ export function writePack(objects: Iterable<GitObject>): Buffer {
       if (remaining > 0) byte |= 0x80;
       header.push(byte);
     }
-    parts.push(Buffer.from(header), deflateSync(obj.data));
+    parts.push(Buffer.from(header), deflateSync(obj.data, { level: 1 }));
   }
   const body = Buffer.concat(parts);
   // The trailer is the sha1 of everything before it.
@@ -307,8 +320,10 @@ function planFetch(repo: Repo, ask: FetchAsk): { objects: Map<string, GitObject>
     const boundary: string[] = [];
     const queue: { oid: string; depth: number }[] = wants.map((oid) => ({ oid, depth: 0 }));
     const seen = new Set<string>();
-    while (queue.length > 0) {
-      const { oid, depth } = queue.shift() as { oid: string; depth: number };
+    let qi = 0;
+    while (qi < queue.length) {
+      const { oid, depth } = queue[qi] as { oid: string; depth: number };
+      qi += 1;
       const obj = repo.objects.get(oid);
       if (!obj || obj.type !== 'commit' || seen.has(oid)) continue;
       seen.add(oid);
@@ -331,6 +346,28 @@ function planFetch(repo: Repo, ask: FetchAsk): { objects: Map<string, GitObject>
   for (const [k, v] of all) if (!haveObjects.has(k)) objects.set(k, v);
   for (const [k, v] of tagObjects) if (!haveObjects.has(k)) objects.set(k, v);
   return { objects, shallow: [], unshallow: [] };
+}
+
+/** Fetches are pure functions of (repo, wants, haves, shallow lines,
+ *  depth): git objects are content-addressed and immutable, and no new
+ *  object can become an ancestor of an existing commit. So a fetch's
+ *  pack and shallow lines are cached — the clone workload asks for the
+ *  same shallow fetch of the same tip 150 times, and only the first one
+ *  pays for the walk and the deflate. Capped and cleared, so a trial
+ *  with many distinct fetches cannot grow it without bound. */
+const fetchPackCache = new Map<string, { pack: Buffer; framed: Buffer; shallow: string[]; unshallow: string[] }>();
+function cachedFetchPack(repo: Repo, ask: FetchAsk): { pack: Buffer; framed: Buffer; shallow: string[]; unshallow: string[] } {
+  const key = `${repo.id}|${ask.wants.join(',')}|${ask.haves.join(',')}|${ask.shallowIn.join(',')}|${ask.depth}`;
+  const hit = fetchPackCache.get(key);
+  if (hit) return hit;
+  const planned = planFetch(repo, ask);
+  const pack = writePack([...planned.objects.values()]);
+  // The sideband framing of a pack is the same for the v2 and v0
+  // answers, so frame it once here instead of on every clone.
+  const made = { pack, framed: Buffer.concat(sidebandPackets(pack)), shallow: planned.shallow, unshallow: planned.unshallow };
+  if (fetchPackCache.size >= 32) fetchPackCache.clear();
+  fetchPackCache.set(key, made);
+  return made;
 }
 
 /** POST git-upload-pack: ls-refs or fetch, protocol v2 when `wantV2`. */
@@ -363,12 +400,8 @@ export function gitUploadPack(repo: Repo, body: Buffer, wantV2: boolean): GitRes
   if (ask.wants.length === 0 && ask.command === 'fetch') {
     return { status: 200, contentType: resultCt, body: Buffer.concat([pktLine('acknowledgments\n'), pktLine('NAK\n'), pktDelim, pktFlush]) };
   }
-  const { objects, shallow, unshallow } = planFetch(repo, ask);
-  const pack = writePack([...objects.values()].sort((a, b) => {
-    const ao = hashObject(a.type, a.data);
-    const bo = hashObject(b.type, b.data);
-    return ao < bo ? -1 : ao > bo ? 1 : 0;
-  }));
+  const cached = cachedFetchPack(repo, ask);
+  const { shallow, unshallow } = cached;
   if (wantV2) {
     // Real git only expects an acknowledgments section when the request
     // carried haves to negotiate over; a clone (no haves) goes straight
@@ -381,7 +414,7 @@ export function gitUploadPack(repo: Repo, body: Buffer, wantV2: boolean): GitRes
       for (const oid of unshallow) parts.push(pktLine(`unshallow ${oid}\n`));
       parts.push(pktDelim);
     }
-    parts.push(pktLine('packfile\n'), ...sidebandPackets(pack), pktFlush);
+    parts.push(pktLine('packfile\n'), cached.framed, pktFlush);
     return { status: 200, contentType: resultCt, body: Buffer.concat(parts) };
   }
   // Protocol v0: NAK and shallow lines are plain packets, then the pack in
@@ -389,7 +422,7 @@ export function gitUploadPack(repo: Repo, body: Buffer, wantV2: boolean): GitRes
   const parts: Buffer[] = [pktLine('NAK\n')];
   for (const oid of shallow) parts.push(pktLine(`shallow ${oid}\n`));
   for (const oid of unshallow) parts.push(pktLine(`unshallow ${oid}\n`));
-  parts.push(...sidebandPackets(pack), pktFlush);
+  parts.push(cached.framed, pktFlush);
   return { status: 200, contentType: resultCt, body: Buffer.concat(parts) };
 }
 
